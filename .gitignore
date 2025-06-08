@@ -1,0 +1,4 @@
+# Git에 올리지 않을 폴더
+data/
+topodiff/checkpoints/
+topodiff/generated/
