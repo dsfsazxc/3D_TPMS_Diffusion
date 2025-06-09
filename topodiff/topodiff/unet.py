@@ -445,12 +445,16 @@ class UNetModel(nn.Module):
         use_scale_shift_norm=False,
         resblock_updown=False,
         use_new_attention_order=False,
+        use_tanh=True,  # ✅ 추가: tanh 사용 여부
+        tanh_sharpness=2.0,  # ✅ 추가: tanh sharpness 파라미터
     ):
         super().__init__()
 
         if num_heads_upsample == -1:
             num_heads_upsample = num_heads
 
+        self.use_tanh = use_tanh
+        self.tanh_sharpness = tanh_sharpness
         self.image_size = image_size
         self.in_channels = in_channels
         self.model_channels = model_channels
@@ -609,11 +613,13 @@ class UNetModel(nn.Module):
                 self.output_blocks.append(TimestepEmbedSequential(*layers))
                 self._feature_size += ch
 
+        # 기존 출력 레이어
         self.out = nn.Sequential(
             normalization(ch),
             nn.SiLU(),
             zero_module(conv_nd(dims, input_ch, out_channels, 3, padding=1)),
         )
+
 
     def convert_to_fp16(self):
         """
@@ -660,7 +666,36 @@ class UNetModel(nn.Module):
             h = th.cat([h, hs.pop()], dim=1)
             h = module(h, emb)
         h = h.type(x.dtype)
-        return self.out(h)
+        output = self.out(h)
+        
+        # ✅ 추가: tanh 매핑 적용
+        if self.use_tanh:
+            # 구조 채널(channel 0)에만 tanh 적용
+            if self.training:
+                # 학습 중: 모든 채널에 적용 (learn_sigma의 경우 6채널)
+                if output.shape[1] == 6:  # learn_sigma=True
+                    # 구조 예측과 분산 예측 분리
+                    structure_pred = output[:, :1]
+                    variance_pred = output[:, 1:2]
+                    cond_pred = output[:, 2:4]
+                    cond_var_pred = output[:, 4:]
+                    
+                    # 구조 채널에만 tanh 적용
+                    structure_pred = th.tanh(self.tanh_sharpness * structure_pred)
+                    
+                    # 다시 합치기
+                    output = th.cat([structure_pred, variance_pred, cond_pred, cond_var_pred], dim=1)
+                else:  # learn_sigma=False
+                    structure_pred = output[:, :1]
+                    cond_pred = output[:, 1:]
+                    structure_pred = th.tanh(self.tanh_sharpness * structure_pred)
+                    output = th.cat([structure_pred, cond_pred], dim=1)
+            else:
+                # 샘플링 중: 구조 채널만 처리
+                if output.shape[1] >= 1:
+                    output[:, :1] = th.tanh(self.tanh_sharpness * output[:, :1])
+        
+        return output
 
 
 class SuperResModel(UNetModel):

@@ -1,8 +1,9 @@
 """
-Train the main diffusion model (regardless of guidance) on images.
+Train a conditional diffusion model for 3D TPMS structure generation.
 """
 
 import argparse
+import os
 
 from topodiff import dist_util, logger
 from topodiff.image_datasets_diffusion_model import load_data
@@ -22,21 +23,29 @@ def main():
     dist_util.setup_dist()
     logger.configure()
 
-    logger.log("creating model and diffusion...")
+    logger.log("Creating model and diffusion...")
     model, diffusion = create_model_and_diffusion(
         **args_to_dict(args, model_and_diffusion_defaults().keys())
     )
     model.to(dist_util.dev())
+    
+    # Log model info
+    logger.log(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    logger.log(f"Input shape: [{args.batch_size}, 3, {args.image_size}, {args.image_size}, {args.image_size}]")
+    logger.log(f"Conditioning: VF range={args.vf_range}, YM range={args.ym_range}")
+    
     schedule_sampler = create_named_schedule_sampler(args.schedule_sampler, diffusion)
 
-    logger.log("creating data loader...")
+    logger.log("Creating data loader...")
     data = load_data(
         data_dir=args.data_dir,
         batch_size=args.batch_size,
         image_size=args.image_size,
+        deterministic=False,
+        num_workers=args.num_workers,
     )
 
-    logger.log("training...")
+    logger.log("Starting training...")
     TrainLoop(
         model=model,
         diffusion=diffusion,
@@ -58,23 +67,32 @@ def main():
 
 def create_argparser():
     defaults = dict(
+        # Data
         data_dir="",
+        num_workers=4,
+        
+        # Training
         schedule_sampler="uniform",
         lr=1e-4,
         weight_decay=0.0,
         lr_anneal_steps=0,
-        batch_size=1,  # 3D는 메모리 사용량이 크므로 작게 시작
-        microbatch=-1,
+        batch_size=8,  # Adjust based on GPU memory
+        microbatch=-1,  # -1 = no gradient accumulation
         ema_rate="0.9999",
-        log_interval=10,
-        save_interval=10000,
+        log_interval=100,
+        save_interval=5000,
         resume_checkpoint="",
-        use_fp16=True,  # 3D에서는 fp16 권장
+        
+        # Model
+        use_fp16=True,  # Recommended for 3D to save memory
         fp16_scale_growth=1e-3,
-
-        dims=3,  # 차원 설정
+        
+        # Conditioning ranges
+        vf_range=[0.1, 0.9],
+        ym_range=[1.0, 100.0],
     )
     defaults.update(model_and_diffusion_defaults())
+    
     parser = argparse.ArgumentParser()
     add_dict_to_argparser(parser, defaults)
     return parser

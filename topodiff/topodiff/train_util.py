@@ -72,10 +72,9 @@ class TrainLoop:
         self.opt = AdamW(
             self.mp_trainer.master_params, lr=self.lr, weight_decay=self.weight_decay
         )
+        
         if self.resume_step:
             self._load_optimizer_state()
-            # Model was resumed, either due to a restart or a checkpoint
-            # being specified at the command line.
             self.ema_params = [
                 self._load_ema_parameters(rate) for rate in self.ema_rate
             ]
@@ -152,8 +151,8 @@ class TrainLoop:
             not self.lr_anneal_steps
             or self.step + self.resume_step < self.lr_anneal_steps
         ):
-            batch, batch_cons, _ = next(self.data)  # 3개 값 받기
-            self.run_step(batch, batch_cons)  # batch_cons 전달
+            batch, cond_dict = next(self.data)
+            self.run_step(batch, cond_dict)
             if self.step % self.log_interval == 0:
                 logger.dumpkvs()
             if self.step % self.save_interval == 0:
@@ -161,37 +160,47 @@ class TrainLoop:
                 if os.environ.get("DIFFUSION_TRAINING_TEST", "") and self.step > 0:
                     return
             self.step += 1
+        
+        # Save final checkpoint
         if (self.step - 1) % self.save_interval != 0:
             self.save()
 
-    def run_step(self, batch, batch_cons=None):
-        self.forward_backward(batch, batch_cons)
+    def run_step(self, batch, cond_dict):
+        self.forward_backward(batch, cond_dict)
         took_step = self.mp_trainer.optimize(self.opt)
         if took_step:
             self._update_ema()
         self._anneal_lr()
         self.log_step()
 
-    def forward_backward(self, batch, batch_cons=None):
+    def forward_backward(self, batch, cond_dict):
+        """
+        Forward and backward pass for conditional diffusion.
+        
+        For concatenate conditioning:
+        - batch shape: [B, 3, D, H, W]
+        - batch[:, 0] is the structure to denoise
+        - batch[:, 1:] are the condition channels (VF, YM)
+        """
         self.mp_trainer.zero_grad()
+        
         for i in range(0, batch.shape[0], self.microbatch):
             micro = batch[i : i + self.microbatch].to(dist_util.dev())
+            micro_cond = {
+                k: v[i : i + self.microbatch] if isinstance(v, th.Tensor) else v
+                for k, v in cond_dict.items()
+            }
             
-            if batch_cons is not None:
-                micro_cons = batch_cons[i : i + self.microbatch].to(dist_util.dev())
-            else:
-                micro_cons = None
-
             last_batch = (i + self.microbatch) >= batch.shape[0]
             t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
 
-            # 매개변수 순서에 주의!
+            # Compute losses with concatenated conditioning
             compute_losses = functools.partial(
                 self.diffusion.training_losses,
                 self.ddp_model,
-                micro,
-                t,  # t가 cons보다 먼저!
-                cons=micro_cons  # 키워드 인자로 전달
+                micro,  # Full concatenated input
+                t,
+                model_kwargs={}  # Additional kwargs if needed
             )
 
             if last_batch or not self.use_ddp:
@@ -207,7 +216,7 @@ class TrainLoop:
 
             loss = (losses["loss"] * weights).mean()
             log_loss_dict(
-                self.diffusion, t, {k: v * weights for k, v in losses.items()}
+                self.diffusion, t, {k: v * weights for k, v in losses.items()}, micro_cond
             )
             self.mp_trainer.backward(loss)
 
@@ -269,14 +278,10 @@ def parse_resume_step_from_filename(filename):
 
 
 def get_blob_logdir():
-    # You can change this to be a separate path to save checkpoints to
-    # a blobstore or some external drive.
     return logger.get_dir()
 
 
 def find_resume_checkpoint():
-    # On your infrastructure, you may want to override this to automatically
-    # discover the latest checkpoint on your blob storage, etc.
     return None
 
 
@@ -290,10 +295,16 @@ def find_ema_checkpoint(main_checkpoint, step, rate):
     return None
 
 
-def log_loss_dict(diffusion, ts, losses):
+def log_loss_dict(diffusion, ts, losses, cond_dict):
     for key, values in losses.items():
         logger.logkv_mean(key, values.mean().item())
-        # Log the quantiles (four quartiles, in particular). #WARNING !!!
-        #for sub_t, sub_loss in zip(ts.cpu().numpy(), values.detach().cpu().numpy()):
-        #    quartile = int(4 * sub_t / diffusion.num_timesteps)
-        #    logger.logkv_mean(f"{key}_q{quartile}", sub_loss)
+        # Log quartiles
+        for sub_t, sub_loss in zip(ts.cpu().numpy(), values.detach().cpu().numpy()):
+            quartile = int(4 * sub_t / diffusion.num_timesteps)
+            logger.logkv_mean(f"{key}_q{quartile}", sub_loss)
+    
+    # Log condition statistics
+    if cond_dict and "vf" in cond_dict:
+        logger.logkv_mean("cond_vf_mean", cond_dict["vf"].mean().item())
+    if cond_dict and "ym" in cond_dict:
+        logger.logkv_mean("cond_ym_mean", cond_dict["ym"].mean().item())

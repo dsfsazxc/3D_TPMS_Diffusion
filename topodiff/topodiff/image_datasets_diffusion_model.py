@@ -1,161 +1,137 @@
-import math
-import random
-
-from PIL import Image
-import blobfile as bf
-from mpi4py import MPI
+import os
 import numpy as np
+import torch as th
 from torch.utils.data import DataLoader, Dataset
 
 
-def load_data(
-    *,
-    data_dir,
-    batch_size,
-    image_size,
-    deterministic=False,
-):
-    """
-    3D 볼륨 데이터 로더
-    """
-    if not data_dir:
-        raise ValueError("unspecified data directory")
+def load_data(*, data_dir, batch_size, image_size, deterministic=False, num_workers=1, train_split=0.8):
+    cond_files = sorted([
+        os.path.join(data_dir, f) for f in os.listdir(data_dir) 
+        if f.endswith('_cond.npz')
+    ])
     
-    all_volumes = _list_volume_files_recursively(data_dir)
+    # Train/Test 분할
+    n_train = int(len(cond_files) * train_split)
+    if deterministic:
+        # Test mode: 뒤의 20% 사용
+        cond_files = cond_files[n_train:]
+    else:
+        # Train mode: 앞의 80% 사용
+        cond_files = cond_files[:n_train]
     
-    dataset = VolumeDataset(
-        image_size,  # 3D에서도 같은 크기 사용
-        all_volumes,
-        shard=MPI.COMM_WORLD.Get_rank(),
-        num_shards=MPI.COMM_WORLD.Get_size()
+    if not cond_files:
+        raise ValueError(f"No files found for {'training' if not deterministic else 'testing'}")
+    
+    # Create dataset
+    dataset = VolumeDataset(image_size, cond_files)
+    
+    # Create dataloader
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=not deterministic,
+        num_workers=num_workers,
+        drop_last=True,
+        pin_memory=th.cuda.is_available()
     )
     
-    if deterministic:
-        loader = DataLoader(
-            dataset, batch_size=batch_size, shuffle=False, num_workers=1, drop_last=True
-        )
-    else:
-        loader = DataLoader(
-            dataset, batch_size=batch_size, shuffle=True, num_workers=1, drop_last=True
-        )
-    
+    # Infinite generator
     while True:
         yield from loader
 
-def _list_volume_files_recursively(data_dir):
-    volumes = []
-    for entry in sorted(bf.listdir(data_dir)):
-        full_path = bf.join(data_dir, entry)
-        ext = entry.split(".")[-1]
-        if "." in entry and ext.lower() in ["npz"]:
-            volumes.append(full_path)
-        elif bf.isdir(full_path):
-            volumes.extend(_list_volume_files_recursively(full_path))
-    return volumes
 
 class VolumeDataset(Dataset):
-    def __init__(self, resolution, volume_paths, shard=0, num_shards=1):
+    """
+    Dataset for 3D volumes with VF and YM conditions.
+    Each sample contains:
+    - volume[0]: Structure field (normalized to [-1, 1])
+    - volume[1]: Volume fraction (constant across volume)
+    - volume[2]: Young's modulus (constant across volume)
+    """
+    
+    def __init__(self, resolution, volume_paths, vf_range=(0.1, 0.9), ym_range=(1.0, 100.0)):
         super().__init__()
         self.resolution = resolution
-        self.local_volumes = volume_paths[shard:][::num_shards]
-    
+        self.volume_paths = volume_paths
+        self.vf_range = vf_range
+        self.ym_range = ym_range
+
     def __len__(self):
-        return len(self.local_volumes)
-    
+        return len(self.volume_paths)
+
     def __getitem__(self, idx):
-        volume_path = self.local_volumes[idx]
-        
-        # npz 파일에서 arr_0 로드
+        # Load volume data
+        volume_path = self.volume_paths[idx]
         with np.load(volume_path) as data:
-            volume = data['arr_0'].astype(np.float32)
+            # Expecting shape (D, H, W, 3) where:
+            # channel 0: structure field
+            # channel 1: volume fraction (scalar expanded to volume)
+            # channel 2: young's modulus (scalar expanded to volume)
+            arr = data['arr_0'].astype(np.float32)
+            
+            # Extract metadata if available
+            vf = data.get('vf', None)
+            ym = data.get('ym', None)
         
-        # 값을 -1~1로 정규화
-        volume_min = volume.min()
-        volume_max = volume.max()
-        if volume_max > volume_min:
-            volume = 2 * (volume - volume_min) / (volume_max - volume_min) - 1
+        # Reshape from (D, H, W, C) to (C, D, H, W)
+        volume = np.transpose(arr, (3, 0, 1, 2))
+        
+        # Normalize structure channel to [-1, 1]
+        structure = volume[0]
+        vmin, vmax = structure.min(), structure.max()
+        if vmax > vmin:
+            structure = 2 * (structure - vmin) / (vmax - vmin) - 1
         else:
-            volume = volume * 0
+            structure = np.zeros_like(structure)
+        volume[0] = structure
         
-        # [D, H, W] -> [1, D, H, W]
-        volume = volume[np.newaxis, ...]
+        # If VF/YM not in metadata, extract from volume
+        if vf is None:
+            vf = volume[1, 0, 0, 0]  # Assuming constant across volume
+        if ym is None:
+            ym = volume[2, 0, 0, 0]  # Assuming constant across volume
+            
+        # Normalize VF and YM to [0, 1] range for network stability
+        vf_norm = (vf - self.vf_range[0]) / (self.vf_range[1] - self.vf_range[0])
+        ym_norm = (ym - self.ym_range[0]) / (self.ym_range[1] - self.ym_range[0])
         
-        # 빈 제약조건 생성 (0개 채널)
-        dummy_cons = np.zeros((0, self.resolution, self.resolution, self.resolution), dtype=np.float32)
+        # Update condition channels with normalized values
+        volume[1] = np.full_like(volume[1], vf_norm)
+        volume[2] = np.full_like(volume[2], ym_norm)
         
-        out_dict = {}
-        return volume, dummy_cons, out_dict  # 3개 반환
+        # Return volume and metadata
+        return volume, {'vf': vf, 'ym': ym, 'vf_norm': vf_norm, 'ym_norm': ym_norm}
+
+
+def create_synthetic_data(num_samples, resolution, save_dir):
+    """
+    Create synthetic data for testing.
+    """
+    os.makedirs(save_dir, exist_ok=True)
     
-    def resize_volume(self, volume, target_size):
-        # 간단한 3D 리사이징 (실제로는 더 정교한 방법 필요)
-        from scipy.ndimage import zoom
-        zoom_factors = [target_size/s for s in volume.shape]
-        return zoom(volume, zoom_factors, order=1)
+    for i in range(num_samples):
+        # Random VF and YM
+        vf = np.random.uniform(0.1, 0.9)
+        ym = np.random.uniform(1.0, 100.0)
         
-class ImageDataset(Dataset):
-    def __init__(
-        self,
-        resolution,
-        image_paths,
-        constraint_pf_paths,
-        loads_paths,
-        shard=0,
-        num_shards=1
-    ):
-        super().__init__()
-        self.resolution = resolution
-        self.local_images = image_paths[shard:][::num_shards]
-        self.local_constraints_pf = constraint_pf_paths[shard:][::num_shards]
-        self.local_loads = loads_paths[shard:][::num_shards]
-
-    def __len__(self):
-        return len(self.local_images)
-
-    def __getitem__(self, idx):
-        volume_path = self.local_volumes[idx]  # 3D 볼륨 경로
-
-        num_im = int((image_path.split("_")[-1]).split(".")[0])
-        num_cons_pf = int((constraint_pf_path.split("_")[-1]).split(".")[0])
-        num_load = int((load_path.split("_")[-1]).split(".")[0])
-        assert num_im == num_cons_pf == num_load, "Problem while loading the images and constraints"
-
-        # 3D 볼륨 데이터 로드 (이미 -1~1 범위라고 가정)
-        volume = np.load(volume_path).astype(np.float32)
+        # Create synthetic structure (e.g., TPMS-like)
+        x = np.linspace(-np.pi, np.pi, resolution)
+        y = np.linspace(-np.pi, np.pi, resolution)
+        z = np.linspace(-np.pi, np.pi, resolution)
+        X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
         
-        # 크기 조정이 필요한 경우
-        if volume.shape != (self.resolution, self.resolution, self.resolution):
-            volume = self.resize_volume(volume, self.resolution)
+        # Gyroid-like structure
+        structure = np.sin(X) * np.cos(Y) + np.sin(Y) * np.cos(Z) + np.sin(Z) * np.cos(X)
+        structure = structure + vf * 2 - 1  # Adjust based on VF
         
-        # [D, H, W, C] -> [C, D, H, W] 형태로 변환
-        volume = volume.reshape(self.resolution, self.resolution, self.resolution, 1)
-        volume = np.transpose(volume, [3, 0, 1, 2])
-
-        constraints_pf = np.load(constraint_pf_path)
-        assert constraints_pf.shape[0:2] == arr.shape[0:2], "The constraints do not fit the dimension of the image"
-
-        loads = np.load(load_path)
-        assert loads.shape[0:2] == arr.shape[0:2], "The constraints do not fit the dimension of the image"
-
-        constraints = np.concatenate([constraints_pf, loads], axis = 2)
-
-        out_dict = {}
-        return np.transpose(arr, [2, 0, 1]).astype(np.float32), np.transpose(constraints, [2, 0, 1]).astype(np.float32), out_dict
-
-def center_crop_arr(pil_image, image_size):
-    # We are not on a new enough PIL to support the `reducing_gap`
-    # argument, which uses BOX downsampling at powers of two first.
-    # Thus, we do it by hand to improve downsample quality.
-    while min(*pil_image.size) >= 2 * image_size:
-        pil_image = pil_image.resize(
-            tuple(x // 2 for x in pil_image.size), resample=Image.BOX
-        )
-
-    scale = image_size / min(*pil_image.size)
-    pil_image = pil_image.resize(
-        tuple(round(x * scale) for x in pil_image.size), resample=Image.BICUBIC
-    )
-
-    arr = np.array(pil_image)
-    crop_y = (arr.shape[0] - image_size) // 2
-    crop_x = (arr.shape[1] - image_size) // 2
-    return arr[crop_y : crop_y + image_size, crop_x : crop_x + image_size]
+        # Create volume with 3 channels
+        volume = np.zeros((resolution, resolution, resolution, 3), dtype=np.float32)
+        volume[..., 0] = structure
+        volume[..., 1] = vf
+        volume[..., 2] = ym
+        
+        # Save
+        filename = os.path.join(save_dir, f'volume_{i:06d}_cond.npz')
+        np.savez_compressed(filename, arr_0=volume, vf=vf, ym=ym)
+        
+    print(f"Created {num_samples} synthetic samples in {save_dir}")
