@@ -1,5 +1,5 @@
 """
-Train a conditional diffusion model for 3D TPMS structure generation.
+Train an unconditional diffusion model for 3D structure generation.
 """
 
 import argparse
@@ -30,9 +30,12 @@ def main():
     model.to(dist_util.dev())
     
     # Log model info
-    logger.log(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-    logger.log(f"Input shape: [{args.batch_size}, 3, {args.image_size}, {args.image_size}, {args.image_size}]")
-    logger.log(f"Conditioning: VF range={args.vf_range}, YM range={args.ym_range}")
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.log(f"Model parameters: {total_params:,} total, {trainable_params:,} trainable")
+    logger.log(f"Model size: {total_params * 4 / 1024**2:.1f} MB (fp32)")
+    logger.log(f"Input shape: [batch_size, 1, {args.image_size}, {args.image_size}, {args.image_size}]")
+    logger.log(f"Output channels: {model.out_channels}")
     
     schedule_sampler = create_named_schedule_sampler(args.schedule_sampler, diffusion)
 
@@ -44,6 +47,13 @@ def main():
         deterministic=False,
         num_workers=args.num_workers,
     )
+
+    # Test data loading
+    logger.log("Testing data loading...")
+    test_batch = next(data)
+    logger.log(f"Loaded test batch: shape={test_batch.shape}, "
+              f"range=[{test_batch.min():.3f}, {test_batch.max():.3f}], "
+              f"mean={test_batch.mean():.3f}")
 
     logger.log("Starting training...")
     TrainLoop(
@@ -67,29 +77,40 @@ def main():
 
 def create_argparser():
     defaults = dict(
-        # Data
+        # Data settings
         data_dir="",
         num_workers=4,
         
-        # Training
+        # Training settings
         schedule_sampler="uniform",
         lr=1e-4,
         weight_decay=0.0,
         lr_anneal_steps=0,
-        batch_size=8,  # Adjust based on GPU memory
-        microbatch=-1,  # -1 = no gradient accumulation
+        batch_size=4,  # Reduced for 3D memory constraints
+        microbatch=-1,  # -1 means no gradient accumulation
         ema_rate="0.9999",
         log_interval=100,
-        save_interval=5000,
+        save_interval=2000,
         resume_checkpoint="",
         
-        # Model
+        # Model settings
         use_fp16=True,  # Recommended for 3D to save memory
         fp16_scale_growth=1e-3,
         
-        # Conditioning ranges
-        vf_range=[0.1, 0.9],
-        ym_range=[1.0, 100.0],
+        # 3D specific settings
+        image_size=64,
+        num_channels=64,  # Reduced from default for memory efficiency
+        num_res_blocks=2,
+        attention_resolutions="16,8",  # Only use attention at lower resolutions
+        channel_mult="1,2,3,4",
+        
+        # Diffusion settings
+        learn_sigma=True,
+        diffusion_steps=1000,
+        noise_schedule="cosine",
+        use_scale_shift_norm=True,
+        resblock_updown=False,
+        use_checkpoint=True,  # Enable gradient checkpointing to save memory
     )
     defaults.update(model_and_diffusion_defaults())
     

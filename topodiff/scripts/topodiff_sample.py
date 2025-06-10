@@ -1,5 +1,5 @@
 """
-Conditional sampling for 3D TPMS structures with target VF and Young's Modulus
+Simple 3D structure sampling from trained diffusion models.
 """
 
 import argparse
@@ -19,7 +19,6 @@ from topodiff.script_util import (
 
 def main():
     args = create_argparser().parse_args()
-    
     dist_util.setup_dist()
     logger.configure()
 
@@ -27,344 +26,183 @@ def main():
     model, diffusion = create_model_and_diffusion(
         **args_to_dict(args, model_and_diffusion_defaults().keys())
     )
-    
-    logger.log(f"Loading model from {args.model_path}...")
     model.load_state_dict(
-        dist_util.load_state_dict(args.model_path, map_location=dist_util.dev())
+        dist_util.load_state_dict(args.model_path, map_location="cpu")
     )
     model.to(dist_util.dev())
     if args.use_fp16:
         model.convert_to_fp16()
     model.eval()
 
-    logger.log("Sampling...")
+    logger.log(f"Model loaded from {args.model_path}")
+    logger.log(f"Sampling {args.num_samples} samples...")
+
+    logger.log("Starting sampling...")
     all_samples = []
-    all_metadata = []
-    
+
     while len(all_samples) * args.batch_size < args.num_samples:
         model_kwargs = {}
-        
-        # Create conditional samples
+
         sample_fn = (
             diffusion.p_sample_loop if not args.use_ddim else diffusion.ddim_sample_loop
         )
-        
-        # Generate samples with conditions
-        samples, metadata = conditional_sample(
-            sample_fn=sample_fn,
-            model=model,
-            shape=(args.batch_size, 3, args.image_size, args.image_size, args.image_size),
-            target_vf=args.target_vf,
-            target_ym=args.target_ym,
-            vf_range=(args.vf_range[0], args.vf_range[1]),
-            ym_range=(args.ym_range[0], args.ym_range[1]),
+
+        # Simple unconditional sampling
+        sample = sample_fn(
+            model,
+            shape=(args.batch_size, 1, args.image_size, args.image_size, args.image_size),
+            noise=None,
             clip_denoised=args.clip_denoised,
             model_kwargs=model_kwargs,
             device=dist_util.dev(),
             progress=True,
         )
+
+        sample = sample.clamp(-1, 1)
+        sample_np = sample.cpu().numpy()
+        all_samples.append(sample_np)
         
-        samples = samples[:, 0:1]  # Extract only the structure channel
-        
-        if args.use_regressor and args.regressor_path:
-            # Use regressor to verify/filter samples
-            samples, metadata = filter_with_regressor(
-                samples, metadata, args, model_kwargs
-            )
-        
-        all_samples.append(samples.cpu().numpy())
-        all_metadata.extend(metadata)
         logger.log(f"Created {len(all_samples) * args.batch_size} samples")
 
-    # Stack all samples
+    # Combine all samples
     arr = np.concatenate(all_samples, axis=0)
-    arr = arr[: args.num_samples]
-    metadata = all_metadata[: args.num_samples]
+    arr = arr[:args.num_samples]
 
-    # Save samples
     if dist.get_rank() == 0:
-        save_samples(arr, metadata, args)
-        logger.log(f"Sampling complete. Saved to {args.output_dir}")
+        save_dir = logger.get_dir()
+        
+        logger.log(f"Saving samples to {save_dir}")
+        
+        # Save individual samples
+        for i in range(len(arr)):
+            out_path = os.path.join(save_dir, f"sample_{i:04d}.npz")
+            np.savez_compressed(out_path, volume=arr[i, 0])
+            
+            if i < 5:  # Log first few samples
+                sample_stats = arr[i, 0]
+                logger.log(f"Sample {i}: shape={sample_stats.shape}, "
+                         f"range=[{sample_stats.min():.3f}, {sample_stats.max():.3f}], "
+                         f"mean={sample_stats.mean():.3f}")
+
+        # Save batch file
+        batch_path = os.path.join(save_dir, "samples_batch.npz")
+        np.savez_compressed(batch_path, samples=arr)
+        logger.log(f"Batch saved to {batch_path}")
+
+        # Create visualizations
+        if args.visualize:
+            logger.log("Creating visualizations...")
+            visualize_samples(arr, args, save_dir)
 
     dist.barrier()
-    logger.log("Sampling complete!")
+    logger.log("Sampling complete.")
 
 
-def conditional_sample(
-    sample_fn,
-    model,
-    shape,
-    target_vf,
-    target_ym,
-    vf_range,
-    ym_range,
-    noise=None,
-    clip_denoised=True,
-    denoised_fn=None,
-    cond_fn=None,
-    model_kwargs=None,
-    device=None,
-    progress=False,
-):
-    """
-    Generate samples with concatenated conditioning.
-    """
-    if model_kwargs is None:
-        model_kwargs = {}
-    
-    B, C, D, H, W = shape
-    
-    # Normalize targets to [0, 1]
-    vf_norm = (target_vf - vf_range[0]) / (vf_range[1] - vf_range[0])
-    ym_norm = (target_ym - ym_range[0]) / (ym_range[1] - ym_range[0])
-    
-    # Create initial noise for structure channel
-    if noise is None:
-        noise = th.randn((B, 1, D, H, W), device=device)
-    
-    # Create condition channels
-    vf_channel = th.full((B, 1, D, H, W), vf_norm, device=device)
-    ym_channel = th.full((B, 1, D, H, W), ym_norm, device=device)
-    
-    # Concatenate to form full input
-    # During sampling, we'll maintain this structure
-    def model_fn(x, t, **kwargs):
-        # x shape: [B, 1, D, H, W] (just the noisy structure)
-        # Concatenate with condition channels
-        model_input = th.cat([x, vf_channel, ym_channel], dim=1)
-        # Get model output
-        out = model(model_input, t, **kwargs)
-        # Return only the structure channel predictions
-        if out.shape[1] == 6:  # learn_sigma=True
-            return th.cat([out[:, :1], out[:, 3:4]], dim=1)
-        else:
-            return out[:, :1]
-    
-    # Run sampling with wrapped model
-    samples = sample_fn(
-        model_fn,
-        (B, 1, D, H, W),  # Shape for structure only
-        noise=noise,
-        clip_denoised=clip_denoised,
-        denoised_fn=denoised_fn,
-        cond_fn=cond_fn,
-        model_kwargs=model_kwargs,
-        device=device,
-        progress=progress,
-    )
-    
-    # Create metadata
-    metadata = [
-        {
-            "target_vf": target_vf,
-            "target_ym": target_ym,
-            "vf_norm": vf_norm,
-            "ym_norm": ym_norm,
-        }
-        for _ in range(B)
-    ]
-    
-    return samples, metadata
-
-
-def filter_with_regressor(samples, metadata, args, model_kwargs):
-    """
-    Use a regressor model to verify/filter generated samples.
-    """
-    logger.log("Loading regressor for sample filtering...")
-    
-    from topodiff.script_util import create_regressor
-    
-    regressor = create_regressor(
-        image_size=args.image_size,
-        in_channels=1,
-        regressor_use_fp16=args.use_fp16,
-        regressor_width=128,
-        regressor_depth=4,
-        regressor_attention_resolutions="32,16,8",
-        regressor_use_scale_shift_norm=True,
-        regressor_resblock_updown=True,
-        regressor_pool="spatial",
-        out_channels=2,
-    )
-    
-    regressor.load_state_dict(
-        dist_util.load_state_dict(args.regressor_path, map_location=dist_util.dev())
-    )
-    regressor.to(dist_util.dev())
-    if args.use_fp16:
-        regressor.convert_to_fp16()
-    regressor.eval()
-    
-    # Predict VF and YM
-    with th.no_grad():
-        # Create dummy timesteps
-        t = th.zeros(samples.shape[0], dtype=th.long, device=samples.device)
-        predictions = regressor(samples, t)
-    
-    # Denormalize predictions
-    vf_pred = predictions[:, 0] * (args.vf_range[1] - args.vf_range[0]) + args.vf_range[0]
-    ym_pred = predictions[:, 1] * (args.ym_range[1] - args.ym_range[0]) + args.ym_range[0]
-    
-    # Update metadata with predictions
-    for i, meta in enumerate(metadata):
-        meta["predicted_vf"] = vf_pred[i].item()
-        meta["predicted_ym"] = ym_pred[i].item()
-        meta["vf_error"] = abs(meta["predicted_vf"] - meta["target_vf"])
-        meta["ym_error"] = abs(meta["predicted_ym"] - meta["target_ym"])
-    
-    # Filter based on tolerance
-    if args.filter_tolerance > 0:
-        filtered_samples = []
-        filtered_metadata = []
-        
-        for i, meta in enumerate(metadata):
-            vf_error_rel = meta["vf_error"] / meta["target_vf"]
-            ym_error_rel = meta["ym_error"] / meta["target_ym"]
-            
-            if vf_error_rel < args.filter_tolerance and ym_error_rel < args.filter_tolerance:
-                filtered_samples.append(samples[i:i+1])
-                filtered_metadata.append(meta)
-        
-        if filtered_samples:
-            samples = th.cat(filtered_samples, dim=0)
-            metadata = filtered_metadata
-            logger.log(f"Kept {len(filtered_samples)} samples after filtering")
-        else:
-            logger.log("Warning: No samples passed the filter!")
-    
-    return samples, metadata
-
-
-def save_samples(samples, metadata, args):
-    """
-    Save generated samples and metadata.
-    """
-    os.makedirs(args.output_dir, exist_ok=True)
-    
-    # Save individual samples
-    for i, (sample, meta) in enumerate(zip(samples, metadata)):
-        # Save as npz with metadata
-        filename = os.path.join(
-            args.output_dir, 
-            f"sample_{i:06d}_vf{meta['target_vf']:.3f}_ym{meta['target_ym']:.1f}.npz"
-        )
-        
-        np.savez_compressed(
-            filename,
-            structure=sample[0],  # Structure field
-            **meta  # All metadata
-        )
-    
-    # Save batch file
-    batch_file = os.path.join(args.output_dir, "all_samples.npz")
-    np.savez_compressed(
-        batch_file,
-        samples=samples,
-        metadata=metadata,
-        args=vars(args)
-    )
-    
-    # Create visualization if requested
-    if args.visualize:
-        visualize_samples(samples, metadata, args)
-
-
-def visualize_samples(samples, metadata, args):
-    """
-    Create visualizations of generated samples.
-    """
+def visualize_samples(samples, args, save_dir):
+    """Create visualizations of the generated samples."""
     import matplotlib.pyplot as plt
-    from mpl_toolkits.mplot3d import Axes3D
     
-    vis_dir = os.path.join(args.output_dir, "visualizations")
-    os.makedirs(vis_dir, exist_ok=True)
+    num_viz = min(args.num_visualize, len(samples))
     
-    for i, (sample, meta) in enumerate(zip(samples[:min(10, len(samples))], metadata)):
-        fig = plt.figure(figsize=(15, 5))
+    for idx in range(num_viz):
+        sample_viz = samples[idx, 0]  # Remove channel dimension
         
-        # Structure field
-        structure = sample[0]
+        # Create figure with multiple views
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        axes = axes.flatten()
         
-        # 2D slices
-        for j, (slice_idx, axis_name) in enumerate([(32, 'X'), (32, 'Y'), (32, 'Z')]):
-            ax = fig.add_subplot(1, 4, j+1)
-            
-            if j == 0:
-                slice_data = structure[slice_idx, :, :]
-            elif j == 1:
-                slice_data = structure[:, slice_idx, :]
-            else:
-                slice_data = structure[:, :, slice_idx]
-            
-            im = ax.imshow(slice_data, cmap='RdBu_r', vmin=-1, vmax=1)
-            ax.set_title(f'{axis_name}={slice_idx}')
-            ax.axis('off')
+        # Calculate value range for consistent coloring
+        vmin, vmax = sample_viz.min(), sample_viz.max()
         
-        # 3D isosurface (simplified)
-        ax = fig.add_subplot(1, 4, 4, projection='3d')
+        # Different slice views
+        mid = args.image_size // 2
+        slices = [
+            (sample_viz[mid, :, :], f'X-slice (x={mid})'),
+            (sample_viz[:, mid, :], f'Y-slice (y={mid})'),
+            (sample_viz[:, :, mid], f'Z-slice (z={mid})'),
+            (sample_viz[mid//2, :, :], f'X-slice (x={mid//2})'),
+            (sample_viz[:, mid//2, :], f'Y-slice (y={mid//2})'),
+            (sample_viz[:, :, mid//2], f'Z-slice (z={mid//2})'),
+        ]
         
-        # Simple threshold visualization
-        threshold = 0.0
-        binary = structure > threshold
+        for i, (slice_data, title) in enumerate(slices):
+            im = axes[i].imshow(slice_data, cmap='coolwarm', vmin=vmin, vmax=vmax)
+            axes[i].set_title(title)
+            axes[i].axis('off')
         
-        # Find surface points (simplified)
-        from skimage import measure
-        try:
-            verts, faces, _, _ = measure.marching_cubes(
-                binary.astype(float), level=0.5, spacing=(1, 1, 1)
-            )
-            ax.plot_trisurf(
-                verts[:, 0], verts[:, 1], faces, verts[:, 2],
-                alpha=0.5, shade=True
-            )
-            ax.set_xlim(0, 64)
-            ax.set_ylim(0, 64)
-            ax.set_zlim(0, 64)
-        except:
-            ax.text(0.5, 0.5, 0.5, "3D visualization failed", 
-                   transform=ax.transAxes, ha='center')
+        # Add colorbar
+        plt.colorbar(im, ax=axes, orientation='horizontal', pad=0.1, shrink=0.8)
         
-        ax.set_title('3D Structure')
+        # Add overall title with statistics
+        fig.suptitle(f'Sample {idx}\nShape: {sample_viz.shape}, '
+                    f'Range: [{vmin:.3f}, {vmax:.3f}], Mean: {sample_viz.mean():.3f}',
+                    fontsize=14)
         
-        # Overall title
-        title = f'Sample {i}: VF={meta["target_vf"]:.3f}, YM={meta["target_ym"]:.1f}'
-        if "predicted_vf" in meta:
-            title += f'\nPredicted: VF={meta["predicted_vf"]:.3f}, YM={meta["predicted_ym"]:.1f}'
-        fig.suptitle(title)
-        
+        # Save visualization
+        viz_path = os.path.join(save_dir, f"sample_{idx:04d}_visualization.png")
         plt.tight_layout()
-        plt.savefig(os.path.join(vis_dir, f'sample_{i:06d}.png'), dpi=150)
+        plt.savefig(viz_path, dpi=150, bbox_inches='tight')
         plt.close()
+        
+        # Save 3D structure analysis
+        analyze_structure(sample_viz, idx, save_dir)
+
+
+def analyze_structure(volume, idx, save_dir):
+    """Analyze and save structure properties."""
+    import matplotlib.pyplot as plt
     
-    logger.log(f"Saved visualizations to {vis_dir}")
+    # Basic statistics
+    stats = {
+        'shape': volume.shape,
+        'min': float(volume.min()),
+        'max': float(volume.max()),
+        'mean': float(volume.mean()),
+        'std': float(volume.std()),
+        'volume_positive': float((volume > 0).sum() / volume.size),
+        'volume_negative': float((volume < 0).sum() / volume.size),
+    }
+    
+    # Save statistics
+    stats_path = os.path.join(save_dir, f"sample_{idx:04d}_stats.txt")
+    with open(stats_path, 'w') as f:
+        for key, value in stats.items():
+            f.write(f"{key}: {value}\n")
+    
+    # Create histogram
+    plt.figure(figsize=(10, 6))
+    plt.hist(volume.flatten(), bins=50, alpha=0.7, density=True)
+    plt.title(f'Sample {idx} - Value Distribution')
+    plt.xlabel('Value')
+    plt.ylabel('Density')
+    plt.grid(True, alpha=0.3)
+    
+    hist_path = os.path.join(save_dir, f"sample_{idx:04d}_histogram.png")
+    plt.savefig(hist_path, dpi=150, bbox_inches='tight')
+    plt.close()
 
 
 def create_argparser():
     defaults = dict(
-        # Model arguments
-        model_path="",
-        regressor_path="",
-        
-        # Sampling arguments
+        # Sampling parameters
+        clip_denoised=True,
         num_samples=10,
-        batch_size=4,
+        batch_size=1,
         use_ddim=False,
         
-        # Conditioning arguments
-        target_vf=0.5,
-        target_ym=50.0,
-        vf_range=[0.1, 0.9],
-        ym_range=[1.0, 100.0],
+        # Model path
+        model_path="",
         
-        # Filtering arguments
-        use_regressor=False,
-        filter_tolerance=0.1,  # Relative error tolerance
-        
-        # Output arguments
-        output_dir="samples",
+        # Visualization
         visualize=True,
+        num_visualize=5,
+        
+        # Model parameters (should match training)
+        image_size=64,
+        use_fp16=True,
     )
+    
+    # Add model and diffusion defaults
     defaults.update(model_and_diffusion_defaults())
     
     parser = argparse.ArgumentParser()
